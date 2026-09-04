@@ -48,6 +48,24 @@ wait_for_wifi_iface() {
   printf '%s\n' "${iface}"
 }
 
+install_offline_driver_bundle() {
+  local bundle="$1" kernel_release="$2" entry
+  [[ -f "${bundle}" ]] || die "Offline driver bundle is missing: ${bundle}"
+
+  while IFS= read -r entry; do
+    case "${entry}" in
+      /*|../*|*/../*) die "Unsafe path in offline driver bundle: ${entry}" ;;
+      "lib/modules/${kernel_release}/"*|lib/firmware/rtw88/rtw8814a_fw.bin|lib/firmware/rtw88/rtw8814a_fw.bin.zst) ;;
+      *) die "Unexpected file in offline driver bundle: ${entry}" ;;
+    esac
+  done < <(tar -tf "${bundle}")
+
+  tar -C / -xf "${bundle}"
+  depmod -a "${kernel_release}"
+  rm -f "${bundle}"
+  log "Installed offline RTL8814AU bundle for ${kernel_release}."
+}
+
 stop_wifi() {
   local iface=""
   iface="$(find_wifi_iface || true)"
@@ -67,20 +85,37 @@ stop_wifi() {
 }
 
 do_setup() {
-  local vendor="${1#0x}" product="${2#0x}" missing=0
+  local vendor="${1#0x}" product="${2#0x}" offline_bundle="${3:-}" missing=0
+  local driver_module=rtw88_8814au kernel_release package module_file module_package
+  local -a packages=(iw wpasupplicant linux-firmware python3 curl wireguard-tools iptables)
+
+  kernel_release="$(uname -r)"
+  if [[ -n "${offline_bundle}" ]]; then
+    install_offline_driver_bundle "${offline_bundle}" "${kernel_release}"
+  fi
   for command_name in iw wpa_supplicant python3 curl wg iptables; do
     command -v "${command_name}" >/dev/null 2>&1 || missing=1
   done
   if [[ ! -e /lib/firmware/rtw88/rtw8814a_fw.bin && ! -e /lib/firmware/rtw88/rtw8814a_fw.bin.zst ]]; then
     missing=1
   fi
+  modinfo "${driver_module}" >/dev/null 2>&1 || missing=1
+
   if (( missing )); then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update
-    apt-get install -y iw wpasupplicant linux-firmware python3 curl wireguard-tools iptables
+    if ! modinfo "${driver_module}" >/dev/null 2>&1; then
+      for package in "linux-modules-${kernel_release}" "linux-modules-extra-${kernel_release}"; do
+        apt-cache show "${package}" >/dev/null 2>&1 && packages+=("${package}")
+      done
+    fi
+    apt-get install -y "${packages[@]}"
   fi
 
-  modprobe rtw88_8814au 2>/dev/null || true
+  modinfo "${driver_module}" >/dev/null 2>&1 || die "Kernel ${kernel_release} does not provide ${driver_module}; install a recent Ubuntu generic kernel and rerun setup"
+  [[ -e /lib/firmware/rtw88/rtw8814a_fw.bin || -e /lib/firmware/rtw88/rtw8814a_fw.bin.zst ]] || die "RTL8814AU firmware is missing after package installation"
+  modprobe "${driver_module}" || die "Could not load ${driver_module} for kernel ${kernel_release}"
+
   local found=0 dev
   for dev in /sys/bus/usb/devices/*; do
     [[ -r "${dev}/idVendor" && -r "${dev}/idProduct" ]] || continue
@@ -91,7 +126,9 @@ do_setup() {
   done
   (( found )) || die "Expected USB device ${vendor}:${product} is not present"
   wait_for_wifi_iface >/dev/null
-  log "Dependencies and RTL8814AU firmware are ready."
+  module_file="$(modinfo -F filename "${driver_module}")"
+  module_package="$(dpkg-query -S "${module_file}" 2>/dev/null | sed -n '1s/:.*//p')"
+  log "RTL8814AU driver is ready for ${kernel_release} (${module_package:-unpackaged})."
 }
 
 ssid_is_visible() {

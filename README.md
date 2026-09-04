@@ -13,6 +13,8 @@ Private IPv4 CIDR -> WireGuard utun -> Lima/QEMU -> USB Wi-Fi
 
 The USB adapter is passed to Linux because macOS does not expose it as a second native Wi-Fi interface. Wi-Fi passwords are requested when connecting and are never saved.
 
+`setup` first uses a matching bundle from `driver/offline/`. If the kernel version does not match, it falls back to installing the Ubuntu driver package online. Known-good metadata and checksums are kept in `driver/known-good.env`.
+
 ## Requirements
 
 - macOS with Homebrew

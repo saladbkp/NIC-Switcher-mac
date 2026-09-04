@@ -35,6 +35,8 @@ WG_LISTEN_PORT="${WG_LISTEN_PORT:-51820}"
 ADMIN_MODE="${ADMIN_MODE:-gui}"
 GUEST_HELPER="${ROOT_DIR}/guest/private-tunnel-guest"
 GUEST_HELPER_REMOTE="/tmp/private-tunnel-guest"
+OFFLINE_DRIVER_DIR="${ROOT_DIR}/driver/offline"
+OFFLINE_DRIVER_REMOTE="/tmp/private-tunnel-driver.tar"
 
 VM_STARTED_BY_UP=0
 UP_IN_PROGRESS=0
@@ -194,9 +196,25 @@ guest_action() {
 }
 
 install_guest_dependencies() {
+  local guest_kernel offline_bundle checksum_file expected_checksum actual_checksum
   copy_guest_helper
   log "Checking Linux guest dependencies..."
-  guest_action setup "${USB_VENDOR_ID}" "${USB_PRODUCT_ID}"
+  guest_kernel="$(guest_shell uname -r | tr -d '\r')"
+  offline_bundle="${OFFLINE_DRIVER_DIR}/rtl8814au-${guest_kernel}.tar"
+  if [[ -f "${offline_bundle}" ]]; then
+    checksum_file="${offline_bundle}.sha256"
+    [[ -f "${checksum_file}" ]] || die "Missing checksum for offline driver bundle: ${checksum_file}"
+    need_command shasum
+    expected_checksum="$(awk 'NR == 1 { print $1 }' "${checksum_file}")"
+    actual_checksum="$(shasum -a 256 "${offline_bundle}" | awk '{ print $1 }')"
+    [[ -n "${expected_checksum}" && "${actual_checksum}" == "${expected_checksum}" ]] || die "Offline driver bundle checksum failed: ${offline_bundle}"
+    log "Using offline RTL8814AU bundle for Linux ${guest_kernel}."
+    limactl copy --backend=scp "${offline_bundle}" "${LIMA_INSTANCE}:${OFFLINE_DRIVER_REMOTE}" >/dev/null
+    guest_action setup "${USB_VENDOR_ID}" "${USB_PRODUCT_ID}" "${OFFLINE_DRIVER_REMOTE}"
+  else
+    log "No offline driver bundle matches Linux ${guest_kernel}; package installation may require Internet access."
+    guest_action setup "${USB_VENDOR_ID}" "${USB_PRODUCT_ID}"
+  fi
 }
 
 validate_target_cidr() {
