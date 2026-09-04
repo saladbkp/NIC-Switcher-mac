@@ -45,3 +45,7 @@ The command scans nearby networks, asks which one to use, prompts for the privat
 ```
 
 The selected SSID and CIDR are stored locally under `.state/`, which is excluded from git. Prefer a `/32` CIDR when only one private host is required.
+
+## Credit
+
+for win + kali version: https://github.com/BogusForlorn/nic-switcher
