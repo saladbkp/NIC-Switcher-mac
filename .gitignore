@@ -1,0 +1,23 @@
+# Local configuration and tunnel state
+.state/
+config.env
+.env
+.env.*
+!.env.example
+
+# Keys, generated profiles, and runtime files
+*.key
+*.pem
+*.p12
+*.mobileconfig
+*.log
+*.pid
+
+# macOS and editors
+.DS_Store
+.AppleDouble
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

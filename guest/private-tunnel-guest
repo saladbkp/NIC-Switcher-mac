@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+RUNTIME_DIR=/run/lima-private-tunnel
+WPA_CONFIG="${RUNTIME_DIR}/wpa.conf"
+WPA_PID="${RUNTIME_DIR}/wpa.pid"
+NETWORK_FILE=/run/systemd/network/80-lima-private-wifi.network
+WG_INTERFACE=wg-private
+WG_PRIVATE_KEY=/etc/wireguard/lima-private.key
+IP_FORWARD_PREVIOUS="${RUNTIME_DIR}/ip-forward.previous"
+FILTER_CHAIN=LIMA_PRIVATE_FORWARD
+NAT_CHAIN=LIMA_PRIVATE_NAT
+
+log() {
+  printf '[guest] %s\n' "$*"
+}
+
+die() {
+  printf '[guest] ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+find_wifi_iface() {
+  iw dev 2>/dev/null | awk '$1 == "Interface" { print $2; exit }'
+}
+
+stop_wireguard() {
+  iptables -D FORWARD -j "${FILTER_CHAIN}" 2>/dev/null || true
+  iptables -F "${FILTER_CHAIN}" 2>/dev/null || true
+  iptables -X "${FILTER_CHAIN}" 2>/dev/null || true
+  iptables -t nat -D POSTROUTING -j "${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -F "${NAT_CHAIN}" 2>/dev/null || true
+  iptables -t nat -X "${NAT_CHAIN}" 2>/dev/null || true
+  ip link delete "${WG_INTERFACE}" 2>/dev/null || true
+  if [[ -r "${IP_FORWARD_PREVIOUS}" ]]; then
+    sysctl -q -w "net.ipv4.ip_forward=$(<"${IP_FORWARD_PREVIOUS}")" || true
+  fi
+  rm -f "${WG_PRIVATE_KEY}" "${IP_FORWARD_PREVIOUS}"
+}
+
+wait_for_wifi_iface() {
+  local iface="" deadline=$((SECONDS + 45))
+  until [[ -n "${iface}" ]]; do
+    iface="$(find_wifi_iface)"
+    (( SECONDS < deadline )) || die "Linux did not create a Wi-Fi interface"
+    [[ -n "${iface}" ]] || sleep 2
+  done
+  printf '%s\n' "${iface}"
+}
+
+stop_wifi() {
+  local iface=""
+  iface="$(find_wifi_iface || true)"
+  if [[ -s "${WPA_PID}" ]]; then
+    local pid
+    pid="$(<"${WPA_PID}")"
+    [[ "${pid}" =~ ^[0-9]+$ ]] && kill "${pid}" 2>/dev/null || true
+  fi
+  pkill -f "wpa_supplicant.*${WPA_CONFIG}" 2>/dev/null || true
+  rm -f "${WPA_PID}" "${WPA_CONFIG}" "${NETWORK_FILE}"
+  networkctl reload >/dev/null 2>&1 || true
+  if [[ -n "${iface}" ]]; then
+    ip -4 address flush dev "${iface}" 2>/dev/null || true
+    ip -4 route flush dev "${iface}" 2>/dev/null || true
+    ip link set "${iface}" down 2>/dev/null || true
+  fi
+}
+
+do_setup() {
+  local vendor="${1#0x}" product="${2#0x}" missing=0
+  for command_name in iw wpa_supplicant python3 curl wg iptables; do
+    command -v "${command_name}" >/dev/null 2>&1 || missing=1
+  done
+  if [[ ! -e /lib/firmware/rtw88/rtw8814a_fw.bin && ! -e /lib/firmware/rtw88/rtw8814a_fw.bin.zst ]]; then
+    missing=1
+  fi
+  if (( missing )); then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y iw wpasupplicant linux-firmware python3 curl wireguard-tools iptables
+  fi
+
+  modprobe rtw88_8814au 2>/dev/null || true
+  local found=0 dev
+  for dev in /sys/bus/usb/devices/*; do
+    [[ -r "${dev}/idVendor" && -r "${dev}/idProduct" ]] || continue
+    if [[ "$(<"${dev}/idVendor")" == "${vendor}" && "$(<"${dev}/idProduct")" == "${product}" ]]; then
+      found=1
+      break
+    fi
+  done
+  (( found )) || die "Expected USB device ${vendor}:${product} is not present"
+  wait_for_wifi_iface >/dev/null
+  log "Dependencies and RTL8814AU firmware are ready."
+}
+
+ssid_is_visible() {
+  local iface="$1" ssid="$2"
+  iw dev "${iface}" scan 2>/dev/null | awk -v wanted="${ssid}" '
+    /^[[:space:]]*SSID: / {
+      sub(/^[[:space:]]*SSID: /, "")
+      if ($0 == wanted) found=1
+    }
+    END { exit !found }
+  '
+}
+
+do_scan() {
+  local iface
+  iface="$(wait_for_wifi_iface)"
+  ip link set "${iface}" up
+  iw dev "${iface}" scan 2>/dev/null | awk '
+    function emit() {
+      if (ssid == "") return
+      if (!(ssid in best_signal) || signal + 0 > best_signal[ssid] + 0) {
+        best_signal[ssid] = signal
+        best_security[ssid] = security
+      }
+    }
+    /^BSS / {
+      emit()
+      ssid=""
+      signal="-999"
+      security="open"
+      next
+    }
+    /^[[:space:]]*signal:/ {
+      signal=$2
+      next
+    }
+    /^[[:space:]]*SSID:/ {
+      line=$0
+      sub(/^[[:space:]]*SSID:[[:space:]]*/, "", line)
+      ssid=line
+      next
+    }
+    /^[[:space:]]*(RSN|WPA):/ {
+      security="wpa-psk"
+      next
+    }
+    END {
+      emit()
+      for (name in best_signal)
+        printf "%s\t%s\t%s\n", name, best_signal[name], best_security[name]
+    }
+  ' | sort -t $'\t' -k2,2nr
+}
+
+write_network_config() {
+  local iface="$1"
+  cat >"${NETWORK_FILE}" <<EOF
+[Match]
+Name=${iface}
+
+[Network]
+DHCP=ipv4
+IPv6AcceptRA=no
+LinkLocalAddressing=no
+
+[DHCPv4]
+UseDNS=no
+UseRoutes=no
+EOF
+  chmod 644 "${NETWORK_FILE}"
+  networkctl reload
+}
+
+write_wpa_config() {
+  local ssid="$1" security="$2"
+  local psk=""
+  umask 077
+  if [[ "${security}" == "open" ]]; then
+    cat >"${WPA_CONFIG}" <<EOF
+ctrl_interface=DIR=${RUNTIME_DIR}/ctrl
+update_config=0
+network={
+    ssid="${ssid//\"/\\\"}"
+    scan_ssid=1
+    key_mgmt=NONE
+}
+EOF
+    return
+  fi
+
+  local password
+  IFS= read -r password || true
+  [[ -n "${password}" ]] || die "No Wi-Fi password was received"
+  (( ${#password} >= 8 && ${#password} <= 63 )) || die "WPA passphrase must contain 8 to 63 characters"
+  psk="$(printf '%s' "${password}" | python3 -c 'import hashlib, sys; secret=sys.stdin.buffer.read(); ssid=sys.argv[1].encode(); print(hashlib.pbkdf2_hmac("sha1", secret, ssid, 4096, 32).hex())' "${ssid}")"
+  cat >"${WPA_CONFIG}" <<EOF
+ctrl_interface=DIR=${RUNTIME_DIR}/ctrl
+update_config=0
+network={
+    ssid="${ssid//\"/\\\"}"
+    scan_ssid=1
+    key_mgmt=WPA-PSK
+    psk=${psk}
+}
+EOF
+  password=""
+  psk=""
+}
+
+pin_target_route() {
+  local iface="$1" target_cidr="$2" target_ip source_ip route gateway="" lease_file=""
+  target_ip="${target_cidr%/*}"
+  source_ip="$(ip -4 -o address show dev "${iface}" scope global | awk 'NR == 1 { split($4,a,"/"); print a[1] }')"
+  [[ -n "${source_ip}" ]] || die "Wi-Fi did not receive an IPv4 address"
+
+  lease_file="/run/systemd/netif/leases/$(cat "/sys/class/net/${iface}/ifindex")"
+  if [[ -r "${lease_file}" ]]; then
+    gateway="$(sed -n 's/^ROUTER=//p' "${lease_file}" | awk '{print $1; exit}')"
+  fi
+  if [[ -n "${gateway}" ]]; then
+    ip -4 route replace "${target_cidr}" via "${gateway}" dev "${iface}" src "${source_ip}"
+  else
+    route="$(ip -4 route get "${target_ip}" oif "${iface}" 2>/dev/null || true)"
+    [[ "${route}" == *" dev ${iface}"* && "${route}" != *" via "* ]] || die "Target is not on-link and DHCP did not provide a gateway"
+    ip -4 route replace "${target_cidr}" dev "${iface}" src "${source_ip}"
+  fi
+
+  while ip -4 route show default dev "${iface}" | grep -q .; do
+    ip -4 route del default dev "${iface}" || break
+  done
+  route="$(ip -4 route get "${target_ip}")"
+  [[ "${route}" == *" dev ${iface}"* ]] || die "The target route was not pinned to ${iface}"
+  log "Pinned ${target_cidr} to ${iface}; no Wi-Fi default route or DNS was installed."
+}
+
+do_start() {
+  local ssid="$1" target_cidr="$2" security="$3" skip_scan="$4"
+  local iface deadline ipv4=""
+  [[ "${security}" == "wpa-psk" || "${security}" == "open" ]] || die "Unsupported security mode: ${security}"
+
+  mkdir -p "${RUNTIME_DIR}" /run/systemd/network
+  chmod 700 "${RUNTIME_DIR}"
+  iface="$(wait_for_wifi_iface)"
+  stop_wireguard
+  stop_wifi
+  ip link set "${iface}" up
+
+  if [[ "${skip_scan}" != 1 ]] && ! ssid_is_visible "${iface}" "${ssid}"; then
+    die "SSID '${ssid}' is not visible to Alfa"
+  fi
+
+  mkdir -p "${RUNTIME_DIR}" /run/systemd/network
+  chmod 700 "${RUNTIME_DIR}"
+  write_network_config "${iface}"
+  write_wpa_config "${ssid}" "${security}"
+  mkdir -p "${RUNTIME_DIR}/ctrl"
+  wpa_supplicant -B -D nl80211 -i "${iface}" -c "${WPA_CONFIG}" -P "${WPA_PID}"
+  networkctl reconfigure "${iface}" >/dev/null 2>&1 || true
+
+  deadline=$((SECONDS + 60))
+  until iw dev "${iface}" link | grep -q '^Connected to '; do
+    (( SECONDS < deadline )) || die "Timed out associating with '${ssid}'"
+    sleep 2
+  done
+
+  deadline=$((SECONDS + 60))
+  until ipv4="$(ip -4 -o address show dev "${iface}" scope global | awk 'NR == 1 { print $4 }')" && [[ -n "${ipv4}" ]]; do
+    networkctl reconfigure "${iface}" >/dev/null 2>&1 || true
+    (( SECONDS < deadline )) || die "Associated with '${ssid}', but DHCP did not return an IPv4 address"
+    sleep 2
+  done
+
+  pin_target_route "${iface}" "${target_cidr}"
+  log "Connected '${ssid}' on ${iface} with ${ipv4}."
+}
+
+do_wireguard_start() {
+  local host_public_key="$1" target_cidr="$2" listen_port="$3"
+  local iface guest_public_key
+  iface="$(find_wifi_iface)"
+  [[ -n "${iface}" ]] || die "No Wi-Fi interface is available"
+  ip -4 route get "${target_cidr%/*}" | grep -q " dev ${iface}" || die "Target route is not using ${iface}"
+
+  stop_wireguard
+  mkdir -p "${RUNTIME_DIR}" /etc/wireguard
+  chmod 700 "${RUNTIME_DIR}"
+  chmod 700 /etc/wireguard
+  umask 077
+  wg genkey >"${WG_PRIVATE_KEY}"
+  guest_public_key="$(wg pubkey <"${WG_PRIVATE_KEY}")"
+
+  ip link add "${WG_INTERFACE}" type wireguard
+  ip address add 10.77.0.1/30 dev "${WG_INTERFACE}"
+  wg set "${WG_INTERFACE}" \
+    listen-port "${listen_port}" \
+    private-key "${WG_PRIVATE_KEY}" \
+    peer "${host_public_key}" \
+    allowed-ips 10.77.0.2/32
+  ip link set "${WG_INTERFACE}" up
+
+  sysctl -n net.ipv4.ip_forward >"${IP_FORWARD_PREVIOUS}"
+  sysctl -q -w net.ipv4.ip_forward=1
+
+  iptables -N "${FILTER_CHAIN}"
+  iptables -I FORWARD 1 -j "${FILTER_CHAIN}"
+  iptables -A "${FILTER_CHAIN}" -i "${WG_INTERFACE}" -o "${iface}" -s 10.77.0.2/32 -d "${target_cidr}" -j ACCEPT
+  iptables -A "${FILTER_CHAIN}" -i "${iface}" -o "${WG_INTERFACE}" -s "${target_cidr}" -d 10.77.0.2/32 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+  iptables -t nat -N "${NAT_CHAIN}"
+  iptables -t nat -I POSTROUTING 1 -j "${NAT_CHAIN}"
+  iptables -t nat -A "${NAT_CHAIN}" -o "${iface}" -s 10.77.0.2/32 -d "${target_cidr}" -j MASQUERADE
+
+  printf 'GUEST_PUBLIC_KEY=%s\n' "${guest_public_key}"
+  log "WireGuard is listening on UDP ${listen_port}."
+}
+
+do_status() {
+  local target_cidr="${1:-}" iface link ipv4 route latest age
+  iface="$(find_wifi_iface || true)"
+  if [[ -z "${iface}" ]]; then
+    printf 'Guest Wi-Fi:  no wireless interface\n'
+    return
+  fi
+  link="$(iw dev "${iface}" link 2>/dev/null | sed -n '1p')"
+  ipv4="$(ip -4 -o address show dev "${iface}" scope global 2>/dev/null | awk 'NR == 1 { print $4 }')"
+  printf 'Guest Wi-Fi:  %s (%s)\n' "${iface}" "${link:-not connected}"
+  printf 'Guest IPv4:   %s\n' "${ipv4:-none}"
+  if [[ -n "${target_cidr}" ]]; then
+    route="$(ip -4 route get "${target_cidr%/*}" 2>/dev/null | head -1 || true)"
+    printf 'Guest route:  %s\n' "${route:-none}"
+  fi
+  if ip link show "${WG_INTERFACE}" >/dev/null 2>&1; then
+    latest="$(wg show "${WG_INTERFACE}" latest-handshakes | awk '{print $2; exit}')"
+    if [[ "${latest:-0}" =~ ^[0-9]+$ ]] && (( latest > 0 )); then
+      age=$(( $(date +%s) - latest ))
+      printf 'Guest tunnel: WireGuard (last handshake %ss ago)\n' "${age}"
+    else
+      printf 'Guest tunnel: WireGuard (waiting for handshake)\n'
+    fi
+  else
+    printf 'Guest tunnel: OFF\n'
+  fi
+}
+
+case "${1:-}" in
+  setup) shift; do_setup "$@" ;;
+  scan) do_scan ;;
+  start) shift; do_start "$@" ;;
+  wireguard-start) shift; do_wireguard_start "$@" ;;
+  stop) stop_wireguard; stop_wifi; log "WireGuard, Wi-Fi, and target route removed." ;;
+  status) shift; do_status "$@" ;;
+  *) die "Usage: private-tunnel-guest {setup|scan|start|wireguard-start|stop|status}" ;;
+esac

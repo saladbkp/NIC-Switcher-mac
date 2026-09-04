@@ -1,0 +1,552 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+STATE_DIR="${PRIVATE_TUNNEL_STATE_DIR:-${ROOT_DIR}/.state}"
+PROFILE_FILE="${STATE_DIR}/profile.env"
+CONFIG_FILE="${PRIVATE_TUNNEL_CONFIG:-${ROOT_DIR}/config.env}"
+
+if [[ -f "${CONFIG_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CONFIG_FILE}"
+fi
+if [[ -f "${PROFILE_FILE}" ]]; then
+  # shellcheck disable=SC1090
+  source "${PROFILE_FILE}"
+fi
+
+LIMA_INSTANCE="${LIMA_INSTANCE:-linux}"
+WIFI_SSID="${WIFI_SSID:-}"
+WIFI_SECURITY="${WIFI_SECURITY:-}"
+TARGET_CIDR="${TARGET_CIDR:-}"
+TARGET_URL="${TARGET_URL:-}"
+USB_VENDOR_ID="${USB_VENDOR_ID:-0x0bda}"
+USB_PRODUCT_ID="${USB_PRODUCT_ID:-0x8813}"
+START_TIMEOUT="${START_TIMEOUT:-75}"
+STOP_VM_ON_DOWN="${STOP_VM_ON_DOWN:-1}"
+SKIP_SSID_SCAN="${SKIP_SSID_SCAN:-0}"
+
+WG_DIR="${STATE_DIR}/wireguard"
+WG_PRIVATE_KEY="${WG_DIR}/host.key"
+WG_PUBLIC_KEY="${WG_DIR}/host.pub"
+WG_CONFIG="${WG_DIR}/lima-private.conf"
+WG_ACTIVE_FILE="${WG_DIR}/active"
+WG_LISTEN_PORT="${WG_LISTEN_PORT:-51820}"
+ADMIN_MODE="${ADMIN_MODE:-gui}"
+GUEST_HELPER="${ROOT_DIR}/guest/private-tunnel-guest"
+GUEST_HELPER_REMOTE="/tmp/private-tunnel-guest"
+
+VM_STARTED_BY_UP=0
+UP_IN_PROGRESS=0
+FORCE_WIFI_SELECT=0
+
+log() {
+  printf '[private-tunnel] %s\n' "$*"
+}
+
+warn() {
+  printf '[private-tunnel] WARNING: %s\n' "$*" >&2
+}
+
+die() {
+  printf '[private-tunnel] ERROR: %s\n' "$*" >&2
+  if [[ "${UP_IN_PROGRESS:-0}" == 1 ]]; then
+    rollback_start 1
+  fi
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: ./private-tunnel <command>
+       ./private-tunnel connect --list
+
+Commands:
+  setup      Install/check the Linux guest dependencies
+  connect    Connect using the locally saved network
+              --list  Scan, list, select, and then connect
+  start      Alias for connect
+  stop       Remove the macOS forwarding rules and release Alfa
+  restart    Stop, then start
+  toggle     Start if stopped; stop if running
+  status     Show the host tunnel, VM, USB, Wi-Fi, and route state
+  forget     Forget the saved SSID and private target (not the password)
+  doctor     Run read-only prerequisite checks
+  help       Show this help
+
+The selected SSID and target are saved only in ignored local state.
+Wi-Fi passwords are never saved. Use connect --list to select a network.
+EOF
+}
+
+need_command() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
+
+lima_status() {
+  limactl list "${LIMA_INSTANCE}" --format '{{.Status}}' 2>/dev/null | tr -d '\r'
+}
+
+lima_running() {
+  [[ "$(lima_status)" == "Running" ]]
+}
+
+check_instance() {
+  local details
+  details="$(limactl list "${LIMA_INSTANCE}" --format '{{.VMType}} {{.Arch}}' 2>/dev/null || true)"
+  [[ -n "${details}" ]] || die "Lima instance '${LIMA_INSTANCE}' does not exist"
+  [[ "${details}" == "qemu x86_64" ]] || die "'${LIMA_INSTANCE}' must be a QEMU x86_64 instance; found: ${details}"
+}
+
+guest_shell() {
+  limactl --tty=false shell --workdir /tmp "${LIMA_INSTANCE}" -- "$@"
+}
+
+usb_in_guest() {
+  local vendor product
+  vendor="${USB_VENDOR_ID#0x}"
+  product="${USB_PRODUCT_ID#0x}"
+  guest_shell bash -c '
+    for dev in /sys/bus/usb/devices/*; do
+      [[ -r "$dev/idVendor" && -r "$dev/idProduct" ]] || continue
+      [[ "$(cat "$dev/idVendor")" == "$1" && "$(cat "$dev/idProduct")" == "$2" ]] && exit 0
+    done
+    exit 1
+  ' _ "${vendor}" "${product}" >/dev/null 2>&1
+}
+
+wifi_in_guest() {
+  guest_shell bash -c "command -v iw >/dev/null && iw dev | awk '\$1 == \"Interface\" { found=1 } END { exit !found }'" >/dev/null 2>&1
+}
+
+recover_wifi_driver() {
+  warn "Resetting the Linux USB Wi-Fi driver after a slow cold boot..."
+  guest_shell sudo bash -c '
+    shopt -s nullglob
+    for interface in /sys/bus/usb/drivers/rtw88_8814au/*:*; do
+      [[ -L "$interface" ]] || continue
+      basename "$interface" > /sys/bus/usb/drivers/rtw88_8814au/unbind
+      exit 0
+    done
+    modprobe -r rtw88_8814au rtw88_usb rtw88_8814a rtw88_core 2>/dev/null || true
+    modprobe rtw88_8814au
+  ' >/dev/null 2>&1 || true
+}
+
+stop_vm() {
+  if lima_running; then
+    log "Stopping Lima instance '${LIMA_INSTANCE}'..."
+    limactl stop "${LIMA_INSTANCE}"
+  fi
+}
+
+start_vm_with_alfa() {
+  local qemu_bin qemu_command deadline
+
+  if lima_running && usb_in_guest; then
+    log "Lima is already running with Alfa attached."
+    return
+  fi
+
+  if lima_running; then
+    log "Lima is running without Alfa; restarting it with USB passthrough."
+    stop_vm
+  fi
+
+  qemu_bin="$(command -v qemu-system-x86_64 || true)"
+  [[ -n "${qemu_bin}" ]] || die "qemu-system-x86_64 is missing (install QEMU with Homebrew)"
+
+  qemu_command="${qemu_bin} -device qemu-xhci,id=xhci -device usb-host,vendorid=${USB_VENDOR_ID},productid=${USB_PRODUCT_ID},id=alfa0,bus=xhci.0"
+  log "Starting '${LIMA_INSTANCE}' with Alfa ${USB_VENDOR_ID}:${USB_PRODUCT_ID}..."
+  QEMU_SYSTEM_X86_64="${qemu_command}" limactl start "${LIMA_INSTANCE}"
+  VM_STARTED_BY_UP=1
+
+  deadline=$((SECONDS + START_TIMEOUT))
+  until usb_in_guest; do
+    (( SECONDS < deadline )) || die "Alfa did not appear in the VM. Check the USB connection, then retry."
+    sleep 2
+  done
+
+  deadline=$((SECONDS + 20))
+  until wifi_in_guest; do
+    if (( SECONDS >= deadline )); then
+      recover_wifi_driver
+      break
+    fi
+    sleep 2
+  done
+  deadline=$((SECONDS + START_TIMEOUT))
+  until wifi_in_guest; do
+    (( SECONDS < deadline )) || die "Alfa USB is present, but Linux did not create a Wi-Fi interface after a driver reset."
+    sleep 2
+  done
+  log "Alfa is attached and its Linux Wi-Fi interface is ready."
+}
+
+copy_guest_helper() {
+  [[ -f "${GUEST_HELPER}" ]] || die "Missing guest helper: ${GUEST_HELPER}"
+  limactl copy --backend=scp "${GUEST_HELPER}" "${LIMA_INSTANCE}:${GUEST_HELPER_REMOTE}" >/dev/null
+  guest_shell chmod 700 "${GUEST_HELPER_REMOTE}"
+}
+
+guest_action() {
+  guest_shell sudo "${GUEST_HELPER_REMOTE}" "$@"
+}
+
+install_guest_dependencies() {
+  copy_guest_helper
+  log "Checking Linux guest dependencies..."
+  guest_action setup "${USB_VENDOR_ID}" "${USB_PRODUCT_ID}"
+}
+
+validate_target_cidr() {
+  python3 -c 'import ipaddress, sys; network=ipaddress.ip_network(sys.argv[1], strict=False); sys.exit(network.version != 4)' "$1" >/dev/null 2>&1
+}
+
+ensure_target_cidr() {
+  local answer
+  if [[ -n "${TARGET_CIDR}" ]]; then
+    validate_target_cidr "${TARGET_CIDR}" || die "Invalid TARGET_CIDR: ${TARGET_CIDR}"
+    return
+  fi
+  [[ -t 0 ]] || die "No target configured. Run interactively or set TARGET_CIDR."
+  read -r -p "Private target IPv4 or CIDR (example: 10.20.30.40/32): " answer
+  [[ -n "${answer}" ]] || die "A private target is required"
+  [[ "${answer}" == */* ]] || answer="${answer}/32"
+  validate_target_cidr "${answer}" || die "Invalid IPv4 CIDR: ${answer}"
+  TARGET_CIDR="${answer}"
+}
+
+choose_wifi() {
+  local scan_output choice index=1 ssid signal security
+  local -a ssids=() securities=()
+
+  if [[ -n "${WIFI_SSID}" && "${FORCE_WIFI_SELECT}" != 1 ]]; then
+    WIFI_SECURITY="${WIFI_SECURITY:-wpa-psk}"
+    return
+  fi
+
+  if [[ "${FORCE_WIFI_SELECT}" != 1 ]]; then
+    die "No saved Wi-Fi network. Run './private-tunnel connect --list' first."
+  fi
+
+  log "Scanning nearby Wi-Fi networks with the USB adapter..."
+  scan_output="$(guest_action scan)"
+  printf '\nNearby Wi-Fi networks:\n'
+  while IFS=$'\t' read -r ssid signal security; do
+    [[ -n "${ssid}" ]] || continue
+    ssids+=("${ssid}")
+    securities+=("${security}")
+    printf '  %2d) %-32s %7s dBm  %s\n' "${index}" "${ssid}" "${signal}" "${security}"
+    index=$((index + 1))
+  done <<<"${scan_output}"
+  printf '   m) Enter a hidden SSID manually\n\n'
+
+  while :; do
+    read -r -p "Select network: " choice
+    if [[ "${choice}" == m || "${choice}" == M ]]; then
+      read -r -p "Hidden SSID: " WIFI_SSID
+      [[ -n "${WIFI_SSID}" ]] || { warn "SSID cannot be empty"; continue; }
+      read -r -p "Security [wpa-psk/open] (default wpa-psk): " WIFI_SECURITY
+      WIFI_SECURITY="${WIFI_SECURITY:-wpa-psk}"
+      SKIP_SSID_SCAN=1
+      break
+    fi
+    if [[ "${choice}" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#ssids[@]} )); then
+      WIFI_SSID="${ssids[choice-1]}"
+      WIFI_SECURITY="${securities[choice-1]}"
+      SKIP_SSID_SCAN=0
+      break
+    fi
+    warn "Choose a listed number or 'm'"
+  done
+}
+
+save_profile() {
+  mkdir -p "${STATE_DIR}"
+  chmod 700 "${STATE_DIR}"
+  umask 077
+  {
+    printf 'WIFI_SSID=%q\n' "${WIFI_SSID}"
+    printf 'WIFI_SECURITY=%q\n' "${WIFI_SECURITY}"
+    printf 'TARGET_CIDR=%q\n' "${TARGET_CIDR}"
+    printf 'SKIP_SSID_SCAN=%q\n' "${SKIP_SSID_SCAN}"
+  } >"${PROFILE_FILE}"
+  chmod 600 "${PROFILE_FILE}"
+}
+
+tunnel_is_running() {
+  local target_ip route_info
+  [[ -n "${TARGET_CIDR}" ]] || return 1
+  target_ip="${TARGET_CIDR%/*}"
+  route_info="$(route -n get "${target_ip}" 2>/dev/null || true)"
+  lima_running \
+    && [[ -f "${WG_ACTIVE_FILE}" ]] \
+    && [[ "${route_info}" == *"destination: ${target_ip}"* ]] \
+    && [[ "${route_info}" == *"interface: utun"* ]]
+}
+
+stop_host_wireguard() {
+  if [[ -f "${WG_CONFIG}" ]] && { [[ -f "${WG_ACTIVE_FILE}" ]] || tunnel_is_running; }; then
+    log "Removing the macOS WireGuard utun route..."
+    admin_wg_quick down || true
+  fi
+  rm -f "${WG_ACTIVE_FILE}"
+}
+
+admin_wg_quick() {
+  local action="$1" wg_quick_bin tool_path
+  wg_quick_bin="$(command -v wg-quick)"
+  tool_path="$(dirname "${wg_quick_bin}"):/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  if [[ "${ADMIN_MODE}" == "sudo" ]]; then
+    sudo env "PATH=${tool_path}" "${wg_quick_bin}" "${action}" "${WG_CONFIG}"
+    return
+  fi
+  [[ "${ADMIN_MODE}" == "gui" ]] || die "ADMIN_MODE must be 'gui' or 'sudo'"
+  osascript - "${wg_quick_bin}" "${action}" "${WG_CONFIG}" "${tool_path}" <<'APPLESCRIPT'
+on run argv
+  set toolPath to quoted form of item 1 of argv
+  set actionName to quoted form of item 2 of argv
+  set configPath to quoted form of item 3 of argv
+  set commandPath to quoted form of item 4 of argv
+  do shell script "env PATH=" & commandPath & " " & toolPath & " " & actionName & " " & configPath with administrator privileges
+end run
+APPLESCRIPT
+}
+
+ensure_host_wireguard_key() {
+  mkdir -p "${WG_DIR}"
+  chmod 700 "${WG_DIR}"
+  if [[ ! -s "${WG_PRIVATE_KEY}" ]]; then
+    umask 077
+    wg genkey >"${WG_PRIVATE_KEY}"
+    wg pubkey <"${WG_PRIVATE_KEY}" >"${WG_PUBLIC_KEY}"
+  fi
+}
+
+start_host_wireguard() {
+  local host_public_key guest_output guest_public_key deadline
+  ensure_host_wireguard_key
+  host_public_key="$(<"${WG_PUBLIC_KEY}")"
+  guest_output="$(guest_action wireguard-start "${host_public_key}" "${TARGET_CIDR}" "${WG_LISTEN_PORT}")"
+  printf '%s\n' "${guest_output}"
+  guest_public_key="$(printf '%s\n' "${guest_output}" | sed -n 's/^GUEST_PUBLIC_KEY=//p' | tail -1)"
+  [[ -n "${guest_public_key}" ]] || die "The guest did not return a WireGuard public key"
+
+  umask 077
+  cat >"${WG_CONFIG}" <<EOF
+[Interface]
+PrivateKey = $(<"${WG_PRIVATE_KEY}")
+Address = 10.77.0.2/32
+
+[Peer]
+PublicKey = ${guest_public_key}
+AllowedIPs = 10.77.0.1/32, ${TARGET_CIDR}
+Endpoint = 127.0.0.1:${WG_LISTEN_PORT}
+PersistentKeepalive = 5
+EOF
+  chmod 600 "${WG_CONFIG}"
+
+  deadline=$((SECONDS + 15))
+  until lsof -nP -iUDP:"${WG_LISTEN_PORT}" 2>/dev/null | grep -q UDP || (( SECONDS >= deadline )); do
+    sleep 1
+  done
+
+  log "Adding ${TARGET_CIDR} to a macOS WireGuard utun interface."
+  log "Approve the macOS administrator dialog to create the utun route."
+  touch "${WG_ACTIVE_FILE}"
+  admin_wg_quick up
+  tunnel_is_running || die "WireGuard started, but macOS did not install the target route"
+}
+
+start_guest_wifi() {
+  local password=""
+
+  case "${WIFI_SECURITY}" in
+    wpa-psk)
+      if [[ -n "${WIFI_PASSWORD:-}" ]]; then
+        password="${WIFI_PASSWORD}"
+      elif [[ -t 0 ]]; then
+        read -r -s -p "Wi-Fi password for ${WIFI_SSID}: " password
+        printf '\n'
+      else
+        die "No interactive terminal. Set WIFI_PASSWORD in the environment for this run."
+      fi
+      [[ -n "${password}" ]] || die "Wi-Fi password cannot be empty for WIFI_SECURITY=wpa-psk"
+      guest_action start "${WIFI_SSID}" "${TARGET_CIDR}" "${WIFI_SECURITY}" "${SKIP_SSID_SCAN}" <<<"${password}"
+      password=""
+      unset WIFI_PASSWORD || true
+      ;;
+    open)
+      guest_action start "${WIFI_SSID}" "${TARGET_CIDR}" "${WIFI_SECURITY}" "${SKIP_SSID_SCAN}" </dev/null
+      ;;
+    *)
+      die "WIFI_SECURITY must be 'wpa-psk' or 'open'"
+      ;;
+  esac
+}
+
+rollback_start() {
+  local original_exit=$? exit_code
+  exit_code="${1:-${original_exit}}"
+  if (( ${BASH_SUBSHELL:-0} > 0 )); then
+    trap - ERR INT TERM
+    exit "${exit_code}"
+  fi
+  [[ "${UP_IN_PROGRESS}" == 1 ]] || exit "${exit_code}"
+  trap - ERR INT TERM
+  set +e
+  warn "Start failed; rolling back the partial tunnel."
+  stop_host_wireguard
+  if lima_running; then
+    copy_guest_helper >/dev/null 2>&1
+    guest_action stop >/dev/null 2>&1
+  fi
+  if [[ "${VM_STARTED_BY_UP}" == 1 ]]; then
+    stop_vm >/dev/null 2>&1
+  fi
+  exit "${exit_code}"
+}
+
+do_setup() {
+  need_command limactl
+  need_command qemu-system-x86_64
+  check_instance
+  start_vm_with_alfa
+  install_guest_dependencies
+  log "Setup complete. Run './private-tunnel connect --list' to select a network."
+}
+
+do_start() {
+  need_command limactl
+  need_command qemu-system-x86_64
+  need_command python3
+  need_command wg
+  need_command wg-quick
+  need_command wireguard-go
+  need_command lsof
+  [[ "${ADMIN_MODE}" != "gui" ]] || need_command osascript
+  if [[ -z "${WIFI_SSID}" && "${FORCE_WIFI_SELECT}" != 1 ]]; then
+    die "No saved Wi-Fi network. Run './private-tunnel connect --list' first."
+  fi
+  if tunnel_is_running; then
+    log "Tunnel is already ON for ${TARGET_CIDR}. Use stop first or connect --list."
+    return
+  fi
+  check_instance
+
+  UP_IN_PROGRESS=1
+  trap rollback_start ERR INT TERM
+  start_vm_with_alfa
+  install_guest_dependencies
+  choose_wifi
+  ensure_target_cidr
+  start_guest_wifi
+  start_host_wireguard
+  save_profile
+  UP_IN_PROGRESS=0
+  trap - ERR INT TERM
+
+  log "Tunnel is ON. Only ${TARGET_CIDR} is forwarded through '${WIFI_SSID}'."
+  if [[ -n "${TARGET_URL}" ]]; then
+    local http_code
+    http_code="$(curl --insecure --silent --output /dev/null --connect-timeout 8 --max-time 12 --write-out '%{http_code}' "${TARGET_URL}" || true)"
+    if [[ "${http_code}" == "000" ]]; then
+      warn "Tunnel is up, but ${TARGET_URL} did not answer yet."
+    else
+      log "Target check returned HTTP ${http_code}: ${TARGET_URL}"
+    fi
+  fi
+}
+
+do_stop() {
+  need_command limactl
+  stop_host_wireguard
+  if lima_running; then
+    copy_guest_helper >/dev/null 2>&1 || true
+    guest_action stop || true
+    if [[ "${STOP_VM_ON_DOWN}" == 1 ]]; then
+      stop_vm
+    fi
+  fi
+  log "Tunnel is OFF. Alfa has been released from the private route."
+}
+
+do_status() {
+  need_command limactl
+  printf 'Tunnel:       %s\n' "$(tunnel_is_running && printf ON || printf OFF)"
+  printf 'Target:       %s\n' "${TARGET_CIDR:-not configured}"
+  printf 'SSID:         %s\n' "${WIFI_SSID:-not configured}"
+  printf 'Lima:         %s (%s)\n' "${LIMA_INSTANCE}" "$(lima_status || printf Missing)"
+  if lima_running; then
+    printf 'Alfa USB:     %s\n' "$(usb_in_guest && printf attached || printf missing)"
+    copy_guest_helper >/dev/null 2>&1 || true
+    guest_action status "${TARGET_CIDR}" || true
+  fi
+}
+
+do_forget() {
+  if [[ -f "${PROFILE_FILE}" ]]; then
+    rm -f "${PROFILE_FILE}"
+    log "Saved SSID and target were forgotten. No Wi-Fi password was stored."
+  else
+    log "No saved network profile exists."
+  fi
+}
+
+do_doctor() {
+  local failed=0 command_name details
+  for command_name in limactl qemu-system-x86_64 python3 wg wg-quick wireguard-go lsof osascript curl; do
+    if command -v "${command_name}" >/dev/null 2>&1; then
+      printf '[ok]   %s\n' "${command_name}"
+    else
+      printf '[fail] %s is missing\n' "${command_name}"
+      failed=1
+    fi
+  done
+
+  details="$(limactl list "${LIMA_INSTANCE}" --format '{{.VMType}} {{.Arch}}' 2>/dev/null || true)"
+  if [[ "${details}" == "qemu x86_64" ]]; then
+    printf '[ok]   Lima instance %s is qemu x86_64\n' "${LIMA_INSTANCE}"
+  else
+    printf '[fail] Lima instance %s: expected qemu x86_64, found %s\n' "${LIMA_INSTANCE}" "${details:-missing}"
+    failed=1
+  fi
+
+  if lima_running; then
+    usb_in_guest && printf '[ok]   Alfa USB is attached\n' || printf '[info] Alfa USB is not attached to the running VM\n'
+    wifi_in_guest && printf '[ok]   Linux Wi-Fi interface exists\n' || printf '[info] Linux Wi-Fi interface is not ready\n'
+  else
+    printf '[info] Lima is stopped; USB and Wi-Fi guest checks were skipped\n'
+  fi
+  return "${failed}"
+}
+
+main() {
+  case "${1:-help}" in
+    setup) do_setup ;;
+    connect|start|up)
+      if [[ "${2:-}" == "--list" ]]; then
+        FORCE_WIFI_SELECT=1
+        if tunnel_is_running; then
+          do_stop
+        fi
+      elif [[ -n "${2:-}" ]]; then
+        die "Unknown option for connect: ${2}"
+      fi
+      do_start
+      ;;
+    stop|down) do_stop ;;
+    restart) do_stop; do_start ;;
+    toggle)
+      if tunnel_is_running; then do_stop; else do_start; fi
+      ;;
+    status) do_status ;;
+    forget) do_forget ;;
+    doctor) do_doctor ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "Unknown command: $1" ;;
+  esac
+}
+
+main "$@"
